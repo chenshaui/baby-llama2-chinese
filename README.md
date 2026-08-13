@@ -38,7 +38,28 @@ python sft.py
 python eval.py
 ```
 
+### 使用历史权重推理
+
+`infer.py` 支持预训练和 SFT 权重，并兼容早期版本保存的 DDP、`torch.compile` 前缀及 causal attention mask。脚本会从 checkpoint 自动推断模型维度、层数、词表大小和 KV head 数，不再需要修改 `eval.py` 中的硬编码配置。
+
+```bash
+# SFT 问答模型
+python infer.py \
+  --checkpoint /path/to/sft_model.pth \
+  --mode sft \
+  --prompt "世界上最大的动物是什么？"
+
+# 预训练模型续写
+python infer.py \
+  --checkpoint /path/to/pretrain_model.pth \
+  --mode pretrain \
+  --prompt "床前明月光，疑是地上霜。举头望明月，"
+```
+
+默认自动选择 CUDA、Apple Silicon MPS 或 CPU。在没有传入 `--prompt` 时会进入交互模式；其他常用参数可通过 `python infer.py --help` 查看。
+
 ## 📢 更新公告
+- 2026年08月13日：新增统一推理入口 `infer.py`，支持在现代 PyTorch/Transformers 环境中直接加载历史权重，并修复 ChatGLM tokenizer 的新版 Transformers 兼容问题。
 - 2024年01月24日：新增了在84亿tokens预训练语料上的两个新模型Llama2-Chinese-92M-v1-smallvocab与Llama2-Chinese-218M-v1，与Llama2-Chinese-92M-v1进行对比分析模型大小和词表大小对预训练效果的影响！
 - 2024年02月29日：新增了在634亿tokens预训练语料上的模型Llama2-Chinese-218M-v3，并以此为基座，使用医学垂直领域SFT数据进行finetune得到模型Llama2-Chinese-218M-v3-MedicalChat
 - 2024年05月21日：新增了数据清洗代码，包括：短文本过滤、Minhash（和Simhash）去重、数据存储格式转换、多数据集合并等功能。代码见clean_data目录，以budubaike数据为例，进行了数据清洗，清洗效果见下文《预训练语料预处理》部分。
