@@ -1,5 +1,4 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import time
 import math
 import pickle
@@ -9,6 +8,7 @@ import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from dataset import PretrainDataset
 import logging
@@ -46,31 +46,61 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+def accumulation_group_size(step, num_batches, accumulation_steps):
+    """Return the divisor for this micro-batch's accumulation group."""
+    group_start = (step // accumulation_steps) * accumulation_steps
+    return min(accumulation_steps, num_batches - group_start)
+
+
+def should_update_gradients(step, num_batches, accumulation_steps):
+    """Update at a full accumulation boundary or at the end of an epoch."""
+    return (step + 1) % accumulation_steps == 0 or step + 1 == num_batches
+
+
+def optimizer_step_index(epoch, step, num_batches, accumulation_steps):
+    """Return the optimizer-step index; all micro-batches in a group share it."""
+    updates_per_epoch = math.ceil(num_batches / accumulation_steps)
+    return epoch * updates_per_epoch + step // accumulation_steps
+
+
+def create_grad_scaler(device_type, enabled):
+    """Use the current GradScaler API while retaining PyTorch 2.0 support."""
+    try:
+        return torch.amp.GradScaler(device_type, enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
 def train_epoch(epoch):
     start_time=time.time()
     for step, (X, Y) in enumerate(train_loader):
-        X=X.to(device)
-        Y=Y.to(device)
-        lr = get_lr(epoch*iter_per_epoch+step) if decay_lr else learning_rate
+        X=X.to(device, non_blocking=True)
+        Y=Y.to(device, non_blocking=True)
+        optimizer_step = optimizer_step_index(
+            epoch, step, iter_per_epoch, gradient_accumulation_steps
+        )
+        lr = get_lr(optimizer_step) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
+        update_gradients = should_update_gradients(
+            step, iter_per_epoch, gradient_accumulation_steps
+        )
         # and using the GradScaler if data type is float16
         #for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = 0 == gradient_accumulation_steps - 1
+            model.require_backward_grad_sync = update_gradients
         with ctx:
             logits = model(X, Y)
-            loss = raw_model.last_loss
-            loss = loss / gradient_accumulation_steps
+            raw_loss = raw_model.last_loss
+            group_size = accumulation_group_size(
+                step, iter_per_epoch, gradient_accumulation_steps
+            )
+            loss = raw_loss / group_size
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
         #
-        if (step + 1) % gradient_accumulation_steps == 0:
+        if update_gradients:
             # clip the gradient
             if grad_clip != 0.0:
                 scaler.unscale_(optimizer)
@@ -89,19 +119,19 @@ def train_epoch(epoch):
                         max_epoch, 
                         step, 
                         iter_per_epoch,
-                        loss.item(), 
+                        raw_loss.item(),
                         optimizer.param_groups[-1]['lr'],
                         spend_time / (step+1) * iter_per_epoch // 60 - spend_time // 60))
         #
-        if step % save_interval == 0:
+        if update_gradients and optimizer_step % save_interval == 0:
             if ddp:
                 if torch.distributed.get_rank() == 0:
                     model.eval()
-                    torch.save(model.module.state_dict(),'{}/iter_{}.pth'.format(save_dir,int(step+epoch*iter_per_epoch)))
+                    torch.save(model.module.state_dict(),'{}/iter_{}.pth'.format(save_dir,optimizer_step))
                     model.train()
             else:
                 model.eval()
-                torch.save(model.state_dict(),'{}/iter_{}.pth'.format(save_dir,int(step+epoch*iter_per_epoch)))
+                torch.save(model.state_dict(),'{}/iter_{}.pth'.format(save_dir,optimizer_step))
                 model.train()
 
 #@torch.no_grad()
@@ -263,8 +293,8 @@ if __name__=="__main__":
     ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
     ctx = (
         nullcontext()
-        if device_type == "cpu"
-        else torch.cuda.amp.autocast()
+        if device_type == "cpu" or dtype == "float32"
+        else torch.autocast(device_type=device_type, dtype=ptdtype)
     )
     #
     best_val_loss = 1e9
@@ -278,14 +308,15 @@ if __name__=="__main__":
         # './data/medical_qa.bin',
         # './data/wiki.bin'
     ]
-    train_ds = PretrainDataset(data_path_list, max_length=max_seq_len,memmap=True)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+    # Read one extra token because the dataset shifts each sample into X[:-1] and Y[1:].
+    train_ds = PretrainDataset(data_path_list, max_length=max_seq_len + 1,memmap=True)
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if ddp else None
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
-        pin_memory=False,
+        pin_memory=device_type == "cuda",
         drop_last=False,
-        shuffle=False,        
+        shuffle=train_sampler is None,
         num_workers=0 if os.name == 'nt' else 4,
         sampler=train_sampler
     )
@@ -302,7 +333,7 @@ if __name__=="__main__":
     model=init_model()
     model.to(device)
     # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    scaler = create_grad_scaler(device_type, enabled=(dtype == 'float16'))
     # optimizer
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     # compile the model
@@ -322,6 +353,8 @@ if __name__=="__main__":
     # training loop
     iter_per_epoch=len(train_loader)
     for epoch in range(max_epoch):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_epoch(epoch)
         #val_loss=valid_epoch(epoch)
         if ddp:
